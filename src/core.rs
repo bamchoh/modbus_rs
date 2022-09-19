@@ -1,3 +1,4 @@
+use std::fmt::Error;
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::{thread, time};
@@ -14,10 +15,10 @@ pub fn conv_u16(len: usize) -> u16 {
     }
 }
 
-pub fn gen_write_buf(resp: ModbusResponse) -> BytesMut {
+pub fn gen_write_buf<T: ModbusResponseSerde>(resp: Option<T>) -> BytesMut {
     let resp_buf = match resp {
-        ModbusResponse::ReadHoldingRegisterResponse(n) => n.encode(),
-        ModbusResponse::None => BytesMut::with_capacity(0),
+        Some(n) => n.encode(),
+        None => BytesMut::with_capacity(0),
     };
 
     let header = ModbusTCPHeader {
@@ -34,18 +35,7 @@ pub fn gen_write_buf(resp: ModbusResponse) -> BytesMut {
     write_buf
 }
 
-pub fn read(mut tcp_stream: TcpStream, tx: std::sync::mpsc::Sender<i32>) -> JoinHandle<()> {
-    thread::spawn(move || {
-        loop {
-            let mut buf = [0 as u8; 64];
-            let n = tcp_stream.read(&mut buf).expect("read failed");
-            tx.send(0).unwrap();
-            dump(&buf, n);
-        }
-    })
-}
-
-fn dump(buf: &[u8], n: usize) {
+pub fn dump(buf: &[u8], n: usize) {
     for i in 0..n {
         if i != 0 {
             print!(":");
@@ -55,7 +45,7 @@ fn dump(buf: &[u8], n: usize) {
     println!();
 }
 
-fn encode_req(req: ModbusRequest) -> BytesMut {
+pub fn encode_req(tx_buf: &mut BytesMut, req: ModbusRequest) {
     let resp_buf = match req {
         ModbusRequest::ReadHoldingRegistersRequest(n) => n.encode(),
         ModbusRequest::None => BytesMut::with_capacity(0),
@@ -68,20 +58,7 @@ fn encode_req(req: ModbusRequest) -> BytesMut {
         unit_id: 255,
     };
 
-    let mut write_buf = BytesMut::with_capacity(1024);
-
-    header.encode(&mut write_buf, resp_buf);
-
-    write_buf
-}
-
-pub fn send(mut tcp_stream: TcpStream, rx: std::sync::mpsc::Receiver<i32>) -> JoinHandle<()> {
-    thread::spawn(move || loop {
-        let req = ReadHoldingRegistersRequest::new(0x1234, 2);
-        let write_buf = encode_req(ModbusRequest::ReadHoldingRegistersRequest(req));
-        tcp_stream.write(&write_buf).expect("write failed");
-        let _ = rx.recv();
-    })
+    header.encode(tx_buf, resp_buf);
 }
 
 #[derive(Debug)]
@@ -116,7 +93,7 @@ impl ModbusTCPHeader {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum ModbusRequest {
     ReadHoldingRegistersRequest(ReadHoldingRegistersRequest),
     None,
@@ -134,20 +111,17 @@ impl ModbusRequest {
     }
 }
 
-pub enum ModbusResponse {
-    ReadHoldingRegisterResponse(ReadHoldingRegisterResponse),
-    None,
-}
-
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct ReadHoldingRegistersRequest {
-    address: u16,
-    quantity: u16,
+    pub address: u16,
+    pub quantity: u16,
 }
 
 impl ReadHoldingRegistersRequest {
-    pub fn new(address: u16, quantity: u16) -> Self {
-        ReadHoldingRegistersRequest { address: address, quantity: quantity }
+    pub fn new(address: u16, quantity: u16) -> ModbusRequest {
+        ModbusRequest::ReadHoldingRegistersRequest(
+            ReadHoldingRegistersRequest { address: address, quantity: quantity }
+        )
     }
 
     pub fn encode(&self) -> BytesMut {
@@ -160,9 +134,19 @@ impl ReadHoldingRegistersRequest {
     }
 }
 
+pub enum ModbusResponse {
+    Some(ReadHoldingRegisterResponse),
+    None,
+}
+
+pub trait ModbusResponseSerde {
+    fn encode(&self) -> BytesMut;
+    fn decode(buf: &[u8]) -> Self;
+}
+
 #[derive(Debug)]
 pub struct ReadHoldingRegisterResponse {
-    values: Vec<u16>
+    pub values: Vec<u16>
 }
 
 impl ReadHoldingRegisterResponse {
@@ -175,7 +159,13 @@ impl ReadHoldingRegisterResponse {
         u8::try_from(v).unwrap()
     }
 
-    pub fn encode(&self) -> BytesMut {
+    pub fn decode2(mut buf: &[u8]) -> Self {
+        ReadHoldingRegisterResponse::decode(buf)
+    }
+}
+
+impl ModbusResponseSerde for ReadHoldingRegisterResponse {
+    fn encode(&self) -> BytesMut {
         let mut resp_buf = BytesMut::with_capacity(2 + self.byte_len() as usize);
         resp_buf.put_u8(0x03);
         resp_buf.put_u8(self.byte_len());
@@ -183,5 +173,30 @@ impl ReadHoldingRegisterResponse {
             resp_buf.put_u16(*value);
         }
         resp_buf
+    }
+
+    fn decode(mut buf: &[u8]) -> Self {
+        let n = buf.get_u8() as usize / 2;
+
+        let mut values: Vec<u16> = Vec::with_capacity(n);
+
+        for i in 0..n {
+            values.push(buf.get_u16());
+        }
+
+        Self::new(values)
+    }
+}
+
+
+pub struct ErrorResponse();
+
+impl ModbusResponseSerde for ErrorResponse {
+    fn encode(&self) -> BytesMut {
+        BytesMut::with_capacity(0)
+    }
+
+    fn decode(buf: &[u8]) -> Self {
+        ErrorResponse()
     }
 }
